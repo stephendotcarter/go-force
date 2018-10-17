@@ -1,7 +1,11 @@
 package force
 
 import (
+	"bytes"
+	"encoding/xml"
 	"fmt"
+	"io/ioutil"
+	"net/http"
 )
 
 const (
@@ -16,6 +20,26 @@ const (
 	idKey          = "{ID}"
 
 	resourcesUri = "/services/data/%v"
+
+	loginSoapRequestBody = `<?xml version="1.0" encoding="utf-8" ?>
+	<env:Envelope
+	xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xmlns:env="http://schemas.xmlsoap.org/soap/envelope/"
+	xmlns:urn="urn:partner.soap.sforce.com">
+		<env:Header>
+			<urn:CallOptions>
+				<urn:client>RestForce</urn:client>
+				<urn:defaultNamespace>sf</urn:defaultNamespace>
+			</urn:CallOptions>
+		</env:Header>
+		<env:Body>
+			<n1:login xmlns:n1="urn:partner.soap.sforce.com">
+				<n1:username>%s</n1:username>
+				<n1:password>%s%s</n1:password>
+			</n1:login>
+		</env:Body>
+	</env:Envelope>`
 )
 
 type ForceApi struct {
@@ -170,6 +194,33 @@ type ChildRelationship struct {
 	RelationshipName    string `json:"relationshipName"`
 }
 
+type soapenvEnvelope struct {
+	XMLName xml.Name
+	Body    struct {
+		LoginResponse struct {
+			Result struct {
+				MetadataServerURL string `xml:"metadataServerUrl"`
+				PasswordExpired   bool   `xml:"passwordExpired"`
+				Sandbox           bool   `xml:"sandbox"`
+				ServerURL         string `xml:"serverUrl"`
+				SessionID         string `xml:"sessionId"`
+				UserID            string `xml:"userId"`
+				UserInfo          struct {
+					OrganizationID      string `xml:"organizationId"`
+					OrganizationName    string `xml:"organizationName"`
+					ProfileID           string `xml:"profileId"`
+					SessionSecondsValid int64  `xml:"sessionSecondsValid"`
+					UserEmail           string `xml:"userEmail"`
+					UserFullName        string `xml:"userFullName"`
+					UserID              string `xml:"userId"`
+					UserName            string `xml:"userName"`
+					UserTimeZone        string `xml:"userTimeZone"`
+				} `xml:"userInfo"`
+			} `xml:"result"`
+		} `xml:"loginResponse"`
+	} `xml:"Body"`
+}
+
 func (forceApi *ForceApi) getApiResources() error {
 	uri := fmt.Sprintf(resourcesUri, forceApi.apiVersion)
 
@@ -234,5 +285,46 @@ func (forceApi *ForceApi) RefreshToken() error {
 	}
 
 	forceApi.oauth.AccessToken = res.AccessToken
+	return nil
+}
+
+func (forceApi *ForceApi) SessionID() error {
+	loginSoapRequestBodyFormatted := fmt.Sprintf(loginSoapRequestBody,
+		forceApi.oauth.userName,
+		forceApi.oauth.password,
+		forceApi.oauth.securityToken,
+	)
+
+	req, err := http.NewRequest("POST",
+		forceApi.oauth.InstanceUrl+"/services/Soap/u/38.0",
+		bytes.NewBuffer([]byte(loginSoapRequestBodyFormatted)),
+	)
+	if err != nil {
+		return err
+	}
+
+	req.Header.Add("Charset", "UTF-8")
+	req.Header.Add("Content-Type", "text/xml")
+	req.Header.Add("SOAPAction", "login")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("Error sending %v request: %v", "POST", err)
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("Error reading response bytes: %v", err)
+	}
+
+	var result soapenvEnvelope
+	unmarshalErr := xml.Unmarshal(respBytes, &result)
+	if unmarshalErr != nil {
+		return fmt.Errorf("Unable to unmarshal response to object: %v", unmarshalErr)
+	}
+
+	forceApi.oauth.AccessToken = result.Body.LoginResponse.Result.SessionID
+
 	return nil
 }
